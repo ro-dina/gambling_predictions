@@ -9,14 +9,15 @@ from atproto_client.models.app.bsky.feed.search_posts import Params
 
 from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 
+import os
+from dotenv import load_dotenv
 
+load_dotenv()  # .env を読み込む
 
-ACOUNT='iyukkuris4s4@gmail.com'
-PASSWD='d5it-mp3d-pen7-unqt'
+ACCOUNT = os.getenv("BSKY_EMAIL")
+PASSWORD = os.getenv("BSKY_APP_PASSWORD")
+
 KWD='日銀'
-
-
-
 def search_posts(
         query: str,
         since_date: str, until_date: str ,
