@@ -17,6 +17,9 @@ load_dotenv()  # .env を読み込む
 ACCOUNT = os.getenv("BSKY_EMAIL")
 PASSWORD = os.getenv("BSKY_APP_PASSWORD")
 
+if not ACCOUNT or not PASSWORD:
+    raise RuntimeError("環境変数 BSKY_EMAIL / BSKY_APP_PASSWORD が読み込めていません")
+
 KWD='日銀'
 def search_posts(
         query: str,
@@ -167,30 +170,28 @@ def weekly_vectors_df(model: Doc2Vec, tags):
 
 # --- 4) 使い方（例） -------------------------------------------
 
-since_date='2024-07-31T15:00:00Z'
-until_date='2025-08-31T15:00:00Z'
+def main():
+    since_date = '2024-07-31T15:00:00Z'
+    until_date = '2025-08-31T15:00:00Z'
 
-posts = search_posts(
-    KWD,
-    since_date,
-    until_date,
-    ACOUNT,
-    PASSWD,
-    100, 50,
-)
-# for p in posts:
-#     print(p.uri, p.author.handle, getattr(p.record, "text", ""))
+    posts = search_posts(
+        KWD,
+        since_date,
+        until_date,
+        ACCOUNT,
+        PASSWORD,
+        100, 50,
+    )
+
+    posts_df = posts_to_df(posts)
+    print(posts_df)
+
+    docs, tags = make_weekly_documents(posts_df, text_col="text", jst=True, rule="W-MON")
+    model = train_doc2vec_and_vectorize(docs, vector_size=128, window=10, min_count=2, epochs=40, dm=1)
+    vecdf = weekly_vectors_df(model, tags)
+    print(vecdf.shape)   # (週数, 128)
+    print(vecdf.head())  # 週ごとの特徴ベクトル（時系列）
 
 
-posts_df = posts_to_df(posts)
-#print(posts_df.head())
-print(posts_df)
-
-# posts_df は「unixtime を index」「text カラム」を持つ DataFrame を想定
-# posts_df = posts_to_df(posts)  # 以前作った関数がある場合
-
-docs, tags = make_weekly_documents(posts_df, text_col="text", jst=True, rule="W-MON")
-model = train_doc2vec_and_vectorize(docs, vector_size=128, window=10, min_count=2, epochs=40, dm=1)
-vecdf = weekly_vectors_df(model, tags)
-print(vecdf.shape)   # (週数, 128)
-print(vecdf.head())  # 週ごとの特徴ベクトル（時系列）
+if __name__ == "__main__":
+    main()
