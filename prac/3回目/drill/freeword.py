@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 
 from datetime import datetime, timezone, timedelta
+from dateutil.relativedelta import relativedelta
 from atproto import Client
 from atproto_client.models.app.bsky.feed.search_posts import Params
 
@@ -10,8 +11,6 @@ from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 
 import os
 from dotenv import load_dotenv
-
-from typing import Any, Iterable, Optional, Tuple, List
 
 load_dotenv()  # .env を読み込む
 
@@ -21,19 +20,19 @@ PASSWORD = os.getenv("BSKY_APP_PASSWORD")
 if not ACCOUNT or not PASSWORD:
     raise RuntimeError("環境変数 BSKY_EMAIL / BSKY_APP_PASSWORD が読み込めていません")
 
-KWD='おはようございます'
+KWD='EU'
 def search_posts(
         query: str,
-        since_date: str, until_date: str,
+        since_date: str, until_date: str ,
         email: str, app_password: str,
         per_page: int = 100, max_pages: int = 50,
-) -> List[Any]:
+):
 
     client = Client()
     client.login(email, app_password)
 
     cursor = None
-    results: List[Any] = []
+    results = []
     for _ in range(max_pages):
         params = Params(q=query, limit=per_page, cursor=cursor,
                         since=since_date, until=until_date)
@@ -45,41 +44,17 @@ def search_posts(
             break
     return results
 
-
-def _get_record_field(record: Any, attr_name: str, dict_key: str) -> Optional[Any]:
-    """Support both Pydantic model objects and dict-like records."""
-    if record is None:
-        return None
-    # Pydantic / object
-    if hasattr(record, attr_name):
-        return getattr(record, attr_name)
-    # dict
-    if isinstance(record, dict):
-        return record.get(dict_key)
-    return None
-
-
-def _get_post_text_and_created_at(record: Any) -> Tuple[str, Optional[str]]:
-    text = _get_record_field(record, "text", "text")
-    created_at = (
-        _get_record_field(record, "created_at", "createdAt")
-        or _get_record_field(record, "createdAt", "createdAt")
-    )
-    return (str(text) if text is not None else ""), (str(created_at) if created_at is not None else None)
-
-def posts_to_df(posts: Iterable[Any]) -> pd.DataFrame:
-    rows: List[dict[str, Any]] = []
+def posts_to_df(posts):
+    rows = []
     for p in posts:
-        record = getattr(p, "record", None)
-        text, created_at = _get_post_text_and_created_at(record)
+        record = getattr(p, "record", {}) or {}
+        text = getattr(record, "text", None) or record.get("text", "")
+        created_at = getattr(record, "created_at", None) or record.get("createdAt")
 
         if created_at:
             # createdAt は ISO 8601 文字列
-            try:
-                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                ts = int(dt.timestamp())  # Unix time (秒)
-            except Exception:
-                ts = None
+            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            ts = int(dt.timestamp())  # Unix time (秒)
         else:
             ts = None
 
@@ -138,7 +113,6 @@ def make_weekly_documents(df: pd.DataFrame,
     assert text_col in df.columns, f"'{text_col}' column not found"
     s = df[text_col].fillna("").astype(str)
 
-# ここがUnix time とJSTの関係を調べてみよう。このプログラムでは、どこでその処理を行っているか確認だろう
     # index(unixtime秒) → datetime（UTC）
     dt_utc = pd.to_datetime(df.index, unit="s", utc=True)
     if jst:
@@ -212,8 +186,7 @@ def main():
     posts_df = posts_to_df(posts)
     print(posts_df)
 
-    #docs, tags = make_weekly_documents(posts_df, text_col="text", jst=True, rule="W-MON") #<- 週
-    docs, tags = make_weekly_documents(posts_df, text_col="text", jst=True, rule="D") #<- 日
+    docs, tags = make_weekly_documents(posts_df, text_col="text", jst=True, rule="W-MON")
     model = train_doc2vec_and_vectorize(docs, vector_size=128, window=10, min_count=2, epochs=40, dm=1)
     vecdf = weekly_vectors_df(model, tags)
     print(vecdf.shape)   # (週数, 128)
