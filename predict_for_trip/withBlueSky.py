@@ -1,13 +1,13 @@
 import requests
 import numpy as np
 import pandas as pd
-import os
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import matplotlib.pyplot as plt
+from onlypastdata import get_exchange_rate
 
 # レートをとってくる（Frankfurter）
 def get_exchange_rate(base: str, target: str, date_start: str, date_end: str) -> pd.DataFrame:
@@ -70,10 +70,30 @@ class FXWindowDataset(Dataset):
         y = torch.tensor([y], dtype=torch.float32)             # (1,)
         return x, y
 
+class MultiFeatureWindowDataset(Dataset):
+    def __init__(self, features: np.ndarray, targets: np.ndarray, seq_len: int):
+        """features: 2D array (N, D), targets: 1D array (N,)
+        学習用に (過去 seq_len ステップ → 翌日のターゲット) のペアを作る Dataset。
+        """
+        assert features.shape[0] == targets.shape[0], "features と targets の長さが一致していません"
+        self.features = features.astype(np.float32)
+        self.targets = targets.astype(np.float32)
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.features) - self.seq_len
+
+    def __getitem__(self, idx):
+        x = self.features[idx : idx + self.seq_len, :]       # (seq_len, D)
+        y = self.targets[idx + self.seq_len]                 # scalar
+        x = torch.from_numpy(x)                              # (seq_len, D)
+        y = torch.tensor([y], dtype=torch.float32)           # (1,)
+        return x, y
+
 class LSTMRegressor(nn.Module):
-    def __init__(self, hidden_size: int = 64, num_layers: int = 1):
+    def __init__(self, input_size: int = 1, hidden_size: int = 64, num_layers: int = 1):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
@@ -110,6 +130,44 @@ def predict_series(model: nn.Module, ds: Dataset, device: str) -> np.ndarray:
             pred = model(x).cpu().numpy().reshape(-1)[0]
             preds.append(pred)
     return np.array(preds, dtype=np.float32)
+
+def load_fx_bluesky(base: str, target: str, date_start: str, date_end: str) -> pd.DataFrame:
+    """FXとBlueskyを結合済みのCSVを読み込む。
+
+    想定する列:
+      - date: 日付
+      - value: 為替レート
+      - post_count: 投稿数
+      - sent_mean: センチメント平均
+      - sent_std: センチメント分散/標準偏差
+
+    CSVパスは data/fx_bluesky/{base}{target}_with_bluesky.csv を想定。
+    必要に応じてファイル名は調整してください。
+    """
+    pair = f"{base}{target}"
+    csv_path = f"data/fx_bluesky/{pair}_with_bluesky.csv"
+
+    df = pd.read_csv(csv_path)
+    df["date"] = pd.to_datetime(df["date"])
+
+    start_ts = pd.to_datetime(date_start)
+    end_ts = pd.to_datetime(date_end)
+    df = df[(df["date"] >= start_ts) & (df["date"] <= end_ts)].copy()
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # 必要な列がなければ0で埋める
+    if "post_count" not in df.columns:
+        df["post_count"] = 0
+    if "sent_mean" not in df.columns:
+        df["sent_mean"] = 0.0
+    if "sent_std" not in df.columns:
+        df["sent_std"] = 0.0
+    if "hike_count" not in df.columns:
+        df["hike_count"] = 0
+    if "cut_count" not in df.columns:
+        df["cut_count"] = 0
+
+    return df
 
 # ===== 旧バージョン: 単純 hold-out 検証用 LSTM（参考用にコメントアウトで残しておく） =====
 # def run_pair(base: str, target: str, date_start: str, date_end: str,
@@ -197,18 +255,11 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
     pair = f"{base}{target}"
     print(f"\n=== WALK-FORWARD {pair} {date_start}..{date_end} ===")
 
-    df = get_exchange_rate(base, target, date_start, date_end)
+    df = load_fx_bluesky(base, target, date_start, date_end)
     if len(df) <= min_train_days + 5:
         raise RuntimeError(
             f"{pair}: データが少なすぎます (len(df)={len(df)}, min_train_days={min_train_days})。期間を広げるか min_train_days/seq_len を調整してください"
         )
-    # 保存処理
-    """
-    out_dir = f"data/fx/{base}{target}"
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f"{base}{target}_{date_start}_{date_end}.csv".replace("-", "")
-    df.to_csv(os.path.join(out_dir, fname), index=False)
-    """
 
     # return系列を作成
     #log returnに変える
@@ -220,10 +271,36 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
     prices = df["value"].to_numpy(dtype=np.float64)
     dates = df["date"].to_numpy()
 
+    # BlueSky由来の特徴は、まずは sent_mean のみを利用する
+    sent_mean = df["sent_mean"].to_numpy(dtype=np.float64)
+
+    # 特徴量行列: [log_return, sent_mean]
+    # いったん次元数を減らし、為替の自己相関 + センチメント平均だけを見る
+    features_raw = np.stack(
+        [rets, sent_mean],
+        axis=1,
+    )  # (n, 2)
+
+    n_features = features_raw.shape[1]
+
     n = len(rets)
-    if n <= min_train_days + seq_len:
+
+    # 実際のデータ長に応じて有効な min_train_days を調整する
+    # ・まずは「seq_len より十分大きいか」をチェック
+    if n <= seq_len + 10:
         raise RuntimeError(
-            f"{pair}: return系列が短すぎます (len(rets)={n}, min_train_days={min_train_days}, seq_len={seq_len})"
+            f"{pair}: return系列が短すぎます (len(rets)={n}, seq_len={seq_len})。期間を広げるか seq_len を下げてください"
+        )
+
+    # 希望の min_train_days と、データ長から逆算した上限の小さい方を有効値とする
+    # n - seq_len - 5 を上限として、少なくとも数ステップ分の検証区間を確保する
+    effective_min_train_days = min(min_train_days, n - seq_len - 5)
+
+    # それでもあまりに短い場合はエラー
+    if effective_min_train_days < 30:
+        raise RuntimeError(
+            f"{pair}: 有効な学習期間が確保できません (len(rets)={n}, min_train_days={min_train_days}, seq_len={seq_len})。"
+            "期間を広げるか、min_train_days/seq_len を下げてください"
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -232,28 +309,34 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
     true_ret_list = []
     date_list = []
 
-    # min_train_days から最後の手前まで1ステップずつ進める
-    for end in range(min_train_days, n):
-        #rolling windowで直近N日のみの学習、コロナ禍などを外す
-        #train_rets = rets[:end]
-        train_window = 500
+    # effective_min_train_days から最後の手前まで1ステップずつ進める
+    for end in range(effective_min_train_days, n):
+        # rolling windowで直近N日のみの学習（直近約1年分を使用）
+        train_window = 365
         start = max(0, end - train_window)
         train_rets = rets[start:end]
+        train_features = features_raw[start:end]  # (L, D)
 
-        # スケールはその時点までのデータにだけfit
+        # ターゲット(return)のスケーリング
         scaler = MinMaxScaler1D().fit(train_rets)
-        train_scaled = scaler.transform(train_rets)
+        train_ret_scaled = scaler.transform(train_rets)
 
-        if len(train_scaled) <= seq_len:
+        if len(train_ret_scaled) <= seq_len:
             continue
 
-        train_ds = FXWindowDataset(train_scaled, seq_len)
+        # 特徴量の標準化（各特徴量ごとに平均0, 分散1程度にする）
+        feat_mean = train_features.mean(axis=0, keepdims=True)
+        feat_std = train_features.std(axis=0, keepdims=True)
+        eps = 1e-8
+        train_features_scaled = (train_features - feat_mean) / (feat_std + eps)
+
+        train_ds = MultiFeatureWindowDataset(train_features_scaled, train_ret_scaled, seq_len)
         if len(train_ds) <= 0:
             continue
 
         train_loader = DataLoader(train_ds, batch_size=32, shuffle=False)
 
-        model = LSTMRegressor(hidden_size=hidden, num_layers=layers).to(device)
+        model = LSTMRegressor(input_size=n_features, hidden_size=hidden, num_layers=layers).to(device)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -262,8 +345,9 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
             _ = train_one(model, train_loader, optimizer, criterion, device)
 
         # 直近seq_lenステップを使って「翌日」のreturnを1ステップ予測
-        last_window_scaled = train_scaled[-seq_len:]
-        x = torch.from_numpy(last_window_scaled.astype(np.float32)).unsqueeze(0).unsqueeze(-1).to(device)
+        last_feat = features_raw[end - seq_len : end]
+        last_feat_scaled = (last_feat - feat_mean) / (feat_std + eps)
+        x = torch.from_numpy(last_feat_scaled.astype(np.float32)).unsqueeze(0).to(device)  # (1, T, D)
         with torch.no_grad():
             pred_scaled = model(x).cpu().numpy().reshape(-1)[0]
 
@@ -286,7 +370,7 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
     print(f"{pair} walk-forward MAE (return): {mae_ret:.6e}")
 
     # 価格パス再構成
-    base_price = float(prices[min_train_days - 1])
+    base_price = float(prices[effective_min_train_days - 1])
     #log return
     #true_prices = base_price * np.cumprod(1.0 + true_ret)
     #pred_prices = base_price * np.cumprod(1.0 + preds_ret)
@@ -310,9 +394,10 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
 
 
 if __name__ == "__main__":
-    # 期間はまず広めがおすすめ（短すぎるとLSTMが学習できません）
-    DATE_START = "2020-01-01"
+    # データ量を少し増やすため、2022年以降に拡張
+    DATE_START = "2022-01-01"
     DATE_END = "2025-12-01"
+
 
     # ハイパーパラメータ（ここだけ触ればOK）
     SEQ_LEN = 30
@@ -330,5 +415,6 @@ if __name__ == "__main__":
             lr=LR,
             hidden=128,
             layers=2,
-            min_train_days=200,
+            # データ量とのバランスを考え、少なくとも約180営業日分を見てから予測を開始
+            min_train_days=180,
         )
