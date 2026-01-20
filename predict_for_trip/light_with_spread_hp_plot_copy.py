@@ -19,15 +19,6 @@ DATE_END = "2025-12-01"
 PLOT_START = "2024-01-01"
 PLOT_END = "2025-05-01"
 
-# 方向評価のため、ほぼ0のリターンは除外する閾値
-DA_EPS = 1e-6
-
-# 簡易バックテストの取引コスト（片道）。例: 0.0001 = 1bp
-TX_COST = 0.0001
-
-# ポジションを±1にするか、予測リターンをそのまま使うか
-PNL_MODE = "sign"  # "sign" or "raw"
-
 SEQ_LEN = 30
 TRAIN_WINDOW = 150
 BATCH_SIZE = 32
@@ -184,7 +175,6 @@ def walk_forward_mae(
         return np.nan, None
 
     preds_price, truths_price, dates_pred = [], [], []
-    preds_ret, truths_ret = [], []
 
     i = TRAIN_WINDOW
     steps_done = 0
@@ -222,11 +212,6 @@ def walk_forward_mae(
         with torch.no_grad():
             pred_ret = model(X_last_t).item()
 
-        # 真の次期リターン（log_ret_next）は df のi行に対応
-        true_ret = float(y_all[i])
-        preds_ret.append(float(pred_ret))
-        truths_ret.append(true_ret)
-
         pred_price = float(prices[i]) * float(np.exp(pred_ret))
         true_price = float(prices[i + 1])
 
@@ -244,9 +229,6 @@ def walk_forward_mae(
 
     preds_price = np.array(preds_price, dtype=np.float32)
     truths_price = np.array(truths_price, dtype=np.float32)
-    preds_ret_np = np.array(preds_ret, dtype=np.float32)
-    truths_ret_np = np.array(truths_ret, dtype=np.float32)
-
     mae = float(np.mean(np.abs(preds_price - truths_price)))
 
     plot_data = None
@@ -258,8 +240,6 @@ def walk_forward_mae(
         d_plot = d[mask]
         t_plot = truths_price[mask]
         p_plot = preds_price[mask]
-        pr_plot = preds_ret_np[mask]
-        tr_plot = truths_ret_np[mask]
 
         if len(d_plot) == 0:
             print(
@@ -269,39 +249,7 @@ def walk_forward_mae(
             plot_data = (d, truths_price, preds_price)
         else:
             mae_window = float(np.mean(np.abs(p_plot - t_plot)))
-
-            # ===== Direction metrics =====
-            # 方向：pred_ret と true_ret の符号が一致した割合
-            # ほぼ0のtrue_retは除外（ノイズ）
-            valid = np.abs(tr_plot) > DA_EPS
-            if valid.sum() == 0:
-                da = float("nan")
-                wda = float("nan")
-            else:
-                da = float(np.mean((np.sign(pr_plot[valid]) == np.sign(tr_plot[valid])).astype(np.float32)))
-                # 重み付き：|true_ret| を重みにする
-                w = np.abs(tr_plot[valid])
-                wda = float(np.sum(w * (np.sign(pr_plot[valid]) == np.sign(tr_plot[valid])).astype(np.float32)) / np.sum(w))
-
-            # ===== Simple PnL backtest =====
-            # position: sign(pred) or raw(pred)
-            if PNL_MODE == "raw":
-                pos = pr_plot
-            else:
-                pos = np.sign(pr_plot)
-
-            # 取引コスト：ポジション変化量に比例（片道コスト）
-            pos_prev = np.concatenate([[0.0], pos[:-1]])
-            turnover = np.abs(pos - pos_prev)
-            cost = TX_COST * turnover
-
-            pnl = pos * tr_plot - cost
-            pnl_sum = float(np.sum(pnl))
-            pnl_mean = float(np.mean(pnl))
-
             print(f"{pair}: MAE(price, window {PLOT_START}..{PLOT_END}) = {mae_window:.4f}")
-            print(f"{pair}: DA(window)={da:.4f}  WDA(window)={wda:.4f}  PnL_sum={pnl_sum:.6f}  PnL_mean={pnl_mean:.6e}")
-
             plot_data = (d_plot, t_plot, p_plot)
 
             plt.figure(figsize=(10, 4))
