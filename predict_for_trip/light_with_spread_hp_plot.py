@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 # ========= Config =========
 PAIRS = ["GBPJPY", "EURJPY", "USDJPY"]          # 優先度: GBP > EUR > USD
 DATA_DIR = "data/fx_bluesky"
-DATE_START = "2021-01-01"
+DATE_START = "2020-01-01"
 DATE_END = "2025-12-01"
 
 # 予測（評価・グラフ）をこの期間に統一したい場合
@@ -38,9 +38,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HP_PAIRS = {"GBPJPY", "EURJPY", "USDJPY"}  # 探索対象（全部やるならこのまま）
 HP_EVAL_STEPS = 120  # 探索は重いので、最初のNステップだけで評価（大きいほど正確だが重い）
 HP_GRID = {
-    "hidden": [64, 128, 256],
-    "layers": [1, 2],
-    "epochs": [60, 100, 140],
+    "hidden": [64],
+    "layers": [1],
+    "epochs": [60],
 }
 
 # 乱数固定（実行のブレを減らす）

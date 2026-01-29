@@ -411,7 +411,7 @@ def run_pair_walk_forward(base: str, target: str, date_start: str, date_end: str
 
 if __name__ == "__main__":
     # データ量を少し増やすため、2022年以降に拡張
-    DATE_START = "2022-01-01"
+    DATE_START = "2020-01-01"
     DATE_END = "2025-12-01"
 
 
